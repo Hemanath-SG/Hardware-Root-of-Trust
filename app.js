@@ -1,1288 +1,690 @@
-// app.js - Hardware Root of Trust Visual Console Application Logic
+// =============================================
+// app.js — Hardware Root of Trust Console Logic
+// =============================================
 
-// ==================== STATE & CONFIGURATION ====================
-let dbMode = "local"; // "local" or "firebase"
+'use strict';
+
+// ── State ─────────────────────────────────────
+let dbMode = 'local';        // 'local' | 'firebase'
 let firestoreDb = null;
-let currentTab = "dashboard";
+let currentTab = 'dashboard';
 
-// WebAuthn Simulation State
-let activeUser = null;
-
-// Measured Boot & PCR State
-let bootComponents = [
-    { id: 0, name: "ROM (RTV Anchor)", file: "rom_boot.bin", desc: "Read-Only Memory. Secure trust anchor.", hash: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", tampered: false },
-    { id: 1, name: "Firmware (UEFI)", file: "uefi_firmware.bin", desc: "System BIOS/UEFI initializes motherboard components.", hash: "4a0c8b6b1df40003058a983ef1de4efc0aa637dd38e0797de899a19d9b626e83", tampered: false },
-    { id: 2, name: "Bootloader (Shim/GRUB)", file: "grub_x64.efi", desc: "Launches the OS kernel.", hash: "f3c2b87d091e2b34a6e8df81c8ea3c4f901abde205c083ba4e6b12a3d02cfbb2", tampered: false },
-    { id: 3, name: "OS Kernel", file: "vmlinuz-linux", desc: "Core Operating System kernel.", hash: "a8b9c0d1e2f30415263748596a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b", tampered: false },
-    { id: 4, name: "System Daemon", file: "systemd-authd", desc: "Root system daemon for user authentication.", hash: "1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c", tampered: false }
+const bootComponents = [
+    { id: 0, name: 'ROM (Trust Anchor)',     file: 'rom_boot.bin',      desc: 'Read-Only Memory. Immutable factory-burned trust anchor.',          pcrTarget: 0,  baseHash: 'e3b0c44298fc1c149afbf4c8996fb924', tampered: false },
+    { id: 1, name: 'Firmware (UEFI/BIOS)',   file: 'uefi_firmware.bin', desc: 'System firmware initializes hardware before bootloader hand-off.',   pcrTarget: 0,  baseHash: '4a0c8b6b1df40003058a983ef1de4efc', tampered: false },
+    { id: 2, name: 'Bootloader (GRUB/Shim)', file: 'grub_x64.efi',      desc: 'Loads and verifies the OS kernel.',                                  pcrTarget: 4,  baseHash: 'f3c2b87d091e2b34a6e8df81c8ea3c4f', tampered: false },
+    { id: 3, name: 'OS Kernel',              file: 'vmlinuz-linux',      desc: 'Core operating system kernel binary.',                               pcrTarget: 8,  baseHash: 'a8b9c0d1e2f3041526374859b8c9d0e1', tampered: false },
+    { id: 4, name: 'System Daemon',          file: 'systemd-authd',      desc: 'Root authentication daemon started by the OS.',                     pcrTarget: 9,  baseHash: '1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e', tampered: false }
 ];
 
-let pcrRegisters = {
-    0: "0000000000000000000000000000000000000000000000000000000000000000", // PCR-0: Firmware
-    4: "0000000000000000000000000000000000000000000000000000000000000000", // PCR-4: Bootloader
-    8: "0000000000000000000000000000000000000000000000000000000000000000", // PCR-8: OS Kernel
-    9: "0000000000000000000000000000000000000000000000000000000000000000"  // PCR-9: System Apps / Daemons
+const ZERO_PCR = '0000000000000000000000000000000000000000000000000000000000000000';
+const pcrRegisters = { 0: ZERO_PCR, 4: ZERO_PCR, 8: ZERO_PCR, 9: ZERO_PCR };
+
+let sealedStore = {}; // { secret, pcrSelection, targetPolicyHash }
+
+// ── Binary Utilities ──────────────────────────
+const bufToHex = buf => Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('');
+const bufToB64u = buf => {
+    const bytes = new Uint8Array(buf);
+    let bin = '';
+    for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+    return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
 };
-
-// Sealed Storage Simulated Database
-let sealedDataStore = {
-    // Encrypted payloads mapped by Policy PCR Composite hash
-    // "composite_hash": { secret: "xxx", pcrSelection: [0,4,8] }
-};
-
-// ==================== BINARY UTILITIES ====================
-function bufferToHex(buffer) {
-    return Array.from(new Uint8Array(buffer))
-        .map(b => b.toString(16).padStart(2, "0"))
-        .join("");
-}
-
-function hexToBuffer(hex) {
-    const bytes = new Uint8Array(hex.length / 2);
-    for (let i = 0; i < bytes.length; i++) {
-        bytes[i] = parseInt(hex.substr(i * 2, 2), 16);
-    }
+const b64uToBuf = b64u => {
+    let b64 = b64u.replace(/-/g, '+').replace(/_/g, '/');
+    while (b64.length % 4) b64 += '=';
+    const bin = atob(b64);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
     return bytes.buffer;
-}
-
-function bufferToBase64url(buffer) {
-    const bytes = new Uint8Array(buffer);
-    let binary = "";
-    for (let i = 0; i < bytes.byteLength; i++) {
-        binary += String.fromCharCode(bytes[i]);
-    }
-    const base64 = btoa(binary);
-    return base64.replace(/\+/g, "-").replace(/\//g, "_").replace(/=/g, "");
-}
-
-function base64urlToBuffer(base64url) {
-    let base64 = base64url.replace(/-/g, "+").replace(/_/g, "/");
-    while (base64.length % 4) {
-        base64 += "=";
-    }
-    const binary = atob(base64);
-    const bytes = new Uint8Array(binary.length);
-    for (let i = 0; i < binary.length; i++) {
-        bytes[i] = binary.charCodeAt(i);
-    }
-    return bytes.buffer;
-}
-
-async function sha256(message) {
-    let buffer;
-    if (typeof message === "string") {
-        buffer = new TextEncoder().encode(message);
-    } else {
-        buffer = message;
-    }
-    const hashBuffer = await window.crypto.subtle.digest("SHA-256", buffer);
-    return hashBuffer;
-}
-
-// ==================== DATABASE LAYER (LOCAL MOCK VS FIREBASE) ====================
-const DbService = {
-    async addCredential(credential) {
-        if (dbMode === "firebase" && firestoreDb) {
-            try {
-                await firestoreDb.collection("webauthn_credentials").doc(credential.username).set(credential);
-            } catch (e) {
-                console.error("Firebase error, writing locally", e);
-                this.addCredentialLocal(credential);
-            }
-        } else {
-            this.addCredentialLocal(credential);
-        }
-    },
-    addCredentialLocal(credential) {
-        let creds = JSON.parse(localStorage.getItem("rot_credentials") || "[]");
-        // Remove duplicate username
-        creds = creds.filter(c => c.username !== credential.username);
-        creds.push(credential);
-        localStorage.setItem("rot_credentials", JSON.stringify(creds));
-    },
-
-    async getCredential(username) {
-        if (dbMode === "firebase" && firestoreDb) {
-            try {
-                const doc = await firestoreDb.collection("webauthn_credentials").doc(username).get();
-                return doc.exists ? doc.data() : null;
-            } catch (e) {
-                console.error("Firebase error reading creds, reading locally", e);
-                return this.getCredentialLocal(username);
-            }
-        } else {
-            return this.getCredentialLocal(username);
-        }
-    },
-    getCredentialLocal(username) {
-        const creds = JSON.parse(localStorage.getItem("rot_credentials") || "[]");
-        return creds.find(c => c.username === username) || null;
-    },
-
-    async getAllCredentials() {
-        if (dbMode === "firebase" && firestoreDb) {
-            try {
-                const snapshot = await firestoreDb.collection("webauthn_credentials").get();
-                const creds = [];
-                snapshot.forEach(doc => creds.push(doc.data()));
-                return creds;
-            } catch (e) {
-                return this.getAllCredentialsLocal();
-            }
-        } else {
-            return this.getAllCredentialsLocal();
-        }
-    },
-    getAllCredentialsLocal() {
-        return JSON.parse(localStorage.getItem("rot_credentials") || "[]");
-    },
-
-    async saveBaselines(baselines) {
-        if (dbMode === "firebase" && firestoreDb) {
-            try {
-                const batch = firestoreDb.batch();
-                for (const component of baselines) {
-                    const docRef = firestoreDb.collection("boot_baselines").doc(component.name);
-                    batch.set(docRef, { name: component.name, hash: component.hash });
-                }
-                await batch.commit();
-            } catch (e) {
-                console.error("Firebase error saving baselines", e);
-                this.saveBaselinesLocal(baselines);
-            }
-        } else {
-            this.saveBaselinesLocal(baselines);
-        }
-    },
-    saveBaselinesLocal(baselines) {
-        localStorage.setItem("rot_baselines", JSON.stringify(baselines));
-    },
-
-    async getBaselines() {
-        if (dbMode === "firebase" && firestoreDb) {
-            try {
-                const snapshot = await firestoreDb.collection("boot_baselines").get();
-                const baselines = [];
-                snapshot.forEach(doc => baselines.push(doc.data()));
-                if (baselines.length === 0) return this.getBaselinesLocal();
-                return baselines;
-            } catch (e) {
-                return this.getBaselinesLocal();
-            }
-        } else {
-            return this.getBaselinesLocal();
-        }
-    },
-    getBaselinesLocal() {
-        return JSON.parse(localStorage.getItem("rot_baselines") || "[]");
-    },
-
-    async addAttestationLog(log) {
-        if (dbMode === "firebase" && firestoreDb) {
-            try {
-                await firestoreDb.collection("attestation_logs").add(log);
-            } catch (e) {
-                console.error("Firebase log write error", e);
-                this.addAttestationLogLocal(log);
-            }
-        } else {
-            this.addAttestationLogLocal(log);
-        }
-    },
-    addAttestationLogLocal(log) {
-        const logs = JSON.parse(localStorage.getItem("rot_logs") || "[]");
-        logs.unshift(log); // newest first
-        localStorage.setItem("rot_logs", JSON.stringify(logs.slice(0, 50))); // Keep last 50
-    },
-
-    async getAttestationLogs() {
-        if (dbMode === "firebase" && firestoreDb) {
-            try {
-                const snapshot = await firestoreDb.collection("attestation_logs").orderBy("timestamp", "desc").limit(20).get();
-                const logs = [];
-                snapshot.forEach(doc => {
-                    const data = doc.data();
-                    // Handle firebase timestamp format
-                    if (data.timestamp && data.timestamp.toDate) {
-                        data.timestamp = data.timestamp.toDate().toISOString();
-                    }
-                    logs.push(data);
-                });
-                return logs;
-            } catch (e) {
-                return this.getAttestationLogsLocal();
-            }
-        } else {
-            return this.getAttestationLogsLocal();
-        }
-    },
-    getAttestationLogsLocal() {
-        return JSON.parse(localStorage.getItem("rot_logs") || "[]");
-    },
-
-    async clearAllData() {
-        localStorage.removeItem("rot_credentials");
-        localStorage.removeItem("rot_baselines");
-        localStorage.removeItem("rot_logs");
-        if (dbMode === "firebase" && firestoreDb) {
-            try {
-                // Warning: Deleting collections client-side in Firestore requires individual doc deletion
-                const collections = ["webauthn_credentials", "boot_baselines", "attestation_logs"];
-                for (const col of collections) {
-                    const snapshot = await firestoreDb.collection(col).get();
-                    const batch = firestoreDb.batch();
-                    snapshot.forEach(doc => batch.delete(doc.ref));
-                    await batch.commit();
-                }
-            } catch (e) {
-                console.error("Error clearing Firebase collections", e);
-            }
-        }
-    }
 };
+const sha256 = async data => {
+    const buf = typeof data === 'string' ? new TextEncoder().encode(data) : data;
+    return crypto.subtle.digest('SHA-256', buf);
+};
+const sha256hex = async data => bufToHex(await sha256(data));
+const esc = s => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 
-// ==================== FIREBASE CONFIG MANAGEMENT ====================
-function initFirebase(config) {
-    try {
-        if (firebase.apps.length > 0) {
-            firebase.app().delete(); // delete previous instances
+// ── Simple CBOR Parser ───────────────────────
+function parseCBOR(buffer) {
+    let off = 0;
+    const b = new Uint8Array(buffer);
+    const dv = new DataView(buffer);
+    const read = () => {
+        const init = b[off++]; const mt = init >> 5; const ai = init & 0x1f;
+        let val = ai < 24 ? ai : ai === 24 ? b[off++] : ai === 25 ? (off += 2, dv.getUint16(off - 2)) : ai === 26 ? (off += 4, dv.getUint32(off - 4)) : 0;
+        switch (mt) {
+            case 0: return val;
+            case 1: return -1 - val;
+            case 2: { const s = b.slice(off, off + val); off += val; return s; }
+            case 3: { const s = new TextDecoder().decode(b.slice(off, off + val)); off += val; return s; }
+            case 4: { const arr = []; for (let i = 0; i < val; i++) arr.push(read()); return arr; }
+            case 5: { const m = new Map(); for (let i = 0; i < val; i++) { const k = read(), v = read(); m.set(k, v); } return m; }
+            case 6: return read();
+            case 7: return val === 20 ? false : val === 21 ? true : val === 22 ? null : val;
         }
-        firebase.initializeApp(config);
-        firestoreDb = firebase.firestore();
-        dbMode = "firebase";
-        
-        // Save config in localStorage
-        localStorage.setItem("firebase_config", JSON.stringify(config));
-        
-        updateFirebaseStatusUI(true, config.projectId);
-        console.log(`Connected to Firebase project: ${config.projectId}`);
-    } catch (error) {
-        console.error("Firebase init failed, reverting to local mock mode:", error);
-        alert("Firebase Connection Failed! Please check your credentials config syntax. Reverting to Mock DB.");
-        useLocalMockDb();
-    }
+    };
+    return read();
 }
 
-function useLocalMockDb() {
-    dbMode = "local";
-    firestoreDb = null;
-    localStorage.removeItem("firebase_config");
-    updateFirebaseStatusUI(false);
-}
-
-function updateFirebaseStatusUI(connected, projectId = "") {
-    const dot = document.getElementById("firebase-status-dot");
-    const text = document.getElementById("firebase-status-text");
-    
-    if (connected) {
-        dot.className = "status-dot connected";
-        text.innerText = `Firestore: ${projectId}`;
-    } else {
-        dot.className = "status-dot local";
-        text.innerText = "Local Mock Database";
-    }
-    // Refresh tables
-    if (currentTab === "database") {
-        renderDbExplorer();
-    }
-}
-
-// Load Firebase configuration if stored
-function loadSavedFirebaseConfig() {
-    const savedConfig = localStorage.getItem("firebase_config");
-    if (savedConfig) {
-        try {
-            const parsed = JSON.parse(savedConfig);
-            initFirebase(parsed);
-            document.getElementById("firebase-config-json").value = JSON.stringify(parsed, null, 2);
-        } catch (e) {
-            useLocalMockDb();
-        }
-    } else {
-        useLocalMockDb();
-    }
-}
-
-// ==================== WEBAUTHN SIMULATOR & CRYPTO ENGINE ====================
-
-// Simple CBOR parser to extract COSE public keys
-function decodeCBOR(buffer) {
-    let offset = 0;
-    const view = new DataView(buffer);
-    const bytes = new Uint8Array(buffer);
-
-    function parse() {
-        if (offset >= bytes.length) throw new Error("Unexpected end of CBOR data");
-        const initial = bytes[offset++];
-        const majorType = initial >> 5;
-        const val = initial & 0x1f;
-
-        let value;
-        if (val < 24) {
-            value = val;
-        } else if (val === 24) {
-            value = bytes[offset++];
-        } else if (val === 25) {
-            value = view.getUint16(offset);
-            offset += 2;
-        } else if (val === 26) {
-            value = view.getUint32(offset);
-            offset += 4;
-        } else if (val === 27) {
-            const hi = view.getUint32(offset);
-            const lo = view.getUint32(offset + 4);
-            value = (hi * 0x100000000) + lo;
-            offset += 8;
-        } else {
-            throw new Error(`Unsupported additional CBOR info ${val} at offset ${offset - 1}`);
-        }
-
-        switch (majorType) {
-            case 0: // Unsigned integer
-                return value;
-            case 1: // Negative integer
-                return -1 - value;
-            case 2: // Byte string
-                const bstr = bytes.slice(offset, offset + value);
-                offset += value;
-                return bstr;
-            case 3: // Text string
-                const tstr = new TextDecoder().decode(bytes.slice(offset, offset + value));
-                offset += value;
-                return tstr;
-            case 4: // Array
-                const arr = [];
-                for (let i = 0; i < value; i++) {
-                    arr.push(parse());
-                }
-                return arr;
-            case 5: // Map (represented as JS Map)
-                const jsMap = new Map();
-                for (let i = 0; i < value; i++) {
-                    const k = parse();
-                    const v = parse();
-                    jsMap.set(k, v);
-                }
-                return jsMap;
-            case 6: // Tag
-                return parse();
-            case 7: // Simple/Float
-                if (val === 20) return false;
-                if (val === 21) return true;
-                if (val === 22) return null;
-                if (val === 23) return undefined;
-                return value;
-        }
-    }
-
-    return parse();
-}
-
-// Convert ECDSA signature from DER format to Raw format for WebCrypto
-function derToRaw(derBuffer) {
-    const der = new Uint8Array(derBuffer);
-    if (der[0] !== 0x30) throw new Error("Invalid signature format (not a DER sequence)");
-    
-    let offset = 2;
-    
-    // Parse R
-    if (der[offset++] !== 0x02) throw new Error("Invalid R marker");
-    const rLen = der[offset++];
-    let rBytes = der.slice(offset, offset + rLen);
-    offset += rLen;
-    
-    // Parse S
-    if (der[offset++] !== 0x02) throw new Error("Invalid S marker");
-    const sLen = der[offset++];
-    let sBytes = der.slice(offset, offset + sLen);
-    
-    // R and S should be 32 bytes each. Strip leading zeroes
-    if (rBytes[0] === 0x00) rBytes = rBytes.slice(1);
-    if (sBytes[0] === 0x00) sBytes = sBytes.slice(1);
-    
-    // Create raw 64 byte output
+// ── DER to Raw (ECDSA Signature Converter) ────
+function derToRaw(der) {
+    const d = new Uint8Array(der);
+    let off = 2;
+    off++; // 0x02
+    const rLen = d[off++];
+    let r = d.slice(off, off + rLen); off += rLen;
+    off++; // 0x02
+    const sLen = d[off++];
+    let s = d.slice(off, off + sLen);
+    if (r[0] === 0) r = r.slice(1);
+    if (s[0] === 0) s = s.slice(1);
     const raw = new Uint8Array(64);
-    raw.set(rBytes, 32 - rBytes.length);
-    raw.set(sBytes, 64 - sBytes.length);
-    
+    raw.set(r, 32 - r.length);
+    raw.set(s, 64 - s.length);
     return raw;
 }
 
-// Logging helper for Cryptographic console
-function logCrypto(message, type = "info") {
-    const consoleEl = document.getElementById("webauthn-console");
-    if (!consoleEl) return;
-    
-    const line = document.createElement("div");
+// ── Console Logging ───────────────────────────
+function clog(msg, type = 'info') {
+    const el = document.getElementById('crypto-console');
+    if (!el) return;
+    const line = document.createElement('div');
     line.className = `console-line ${type}`;
-    line.innerText = `[${new Date().toLocaleTimeString()}] ${message}`;
-    consoleEl.appendChild(line);
-    consoleEl.scrollTop = consoleEl.scrollHeight;
+    line.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
+    el.appendChild(line);
+    el.scrollTop = el.scrollHeight;
 }
 
-// WebAuthn Registration Action
-async function handleWebAuthnRegister() {
-    const username = document.getElementById("auth-username").value.trim();
-    if (!username) {
-        alert("Please enter a username.");
-        return;
-    }
-
-    logCrypto(`Starting registration sequence for user: "${username}"`, "system");
-    
-    if (!window.isSecureContext) {
-        logCrypto("ERROR: WebAuthn requires a Secure Context (localhost/https). Run via start_server.ps1!", "error");
-        alert("Secure context missing. Open the app via http://localhost:8000!");
-        return;
-    }
-
-    if (!navigator.credentials || !navigator.credentials.create) {
-        logCrypto("ERROR: WebAuthn is not supported by your browser.", "error");
-        return;
-    }
-
-    try {
-        // Step 1: Generate dynamic challenge
-        const challengeBuffer = new Uint8Array(32);
-        window.crypto.getRandomValues(challengeBuffer);
-        const challengeHex = bufferToHex(challengeBuffer);
-        
-        logCrypto(`Generated server challenge: ${challengeHex.substring(0, 16)}...`, "info");
-
-        // Step 2: Configure credential creation options
-        const createOptions = {
-            publicKey: {
-                challenge: challengeBuffer,
-                rp: {
-                    name: "Hardware Root of Trust Demo",
-                    id: window.location.hostname
-                },
-                user: {
-                    id: new TextEncoder().encode(username),
-                    name: username,
-                    displayName: username
-                },
-                pubKeyCredParams: [
-                    { type: "public-key", alg: -7 } // ES256 (P-256 Curve ECDSA)
-                ],
-                timeout: 60000,
-                attestation: "none",
-                authenticatorSelection: {
-                    userVerification: "preferred"
-                }
-            }
-        };
-
-        logCrypto("Calling navigator.credentials.create(). Hardware TPM/Enclave prompted...", "system");
-        
-        // Step 3: Prompt user for hardware fingerprint/security key
-        const credential = await navigator.credentials.create(createOptions);
-        
-        logCrypto("Credential created! Decoding response from TPM...", "success");
-
-        const response = credential.response;
-        const clientDataJSON = new TextDecoder().decode(response.clientDataJSON);
-        logCrypto(`Received clientDataJSON: ${clientDataJSON}`, "data");
-
-        // Parse authData from attestationObject
-        const attestationObject = response.attestationObject;
-        const decodedAttestation = decodeCBOR(attestationObject);
-        const authData = decodedAttestation.get("authData");
-        
-        logCrypto(`Decoded Authenticator Data bytes (Length: ${authData.byteLength})`, "info");
-        
-        // Extract fields from authData
-        const view = new DataView(authData.buffer, authData.byteOffset, authData.byteLength);
-        const flags = authData[32];
-        const signCount = view.getUint32(33);
-        
-        // Check if AT (Attestation Data Present) flag is set
-        const hasAttestation = !!(flags & 0x40);
-        logCrypto(`Flags: UP (User Present) = ${!!(flags & 0x01)}, UV (User Verified) = ${!!(flags & 0x04)}, AT = ${hasAttestation}`, "info");
-        logCrypto(`Hardware Signature Counter: ${signCount}`, "info");
-
-        if (!hasAttestation) {
-            throw new Error("No attested credential data found in authData");
+// ── Database Layer ────────────────────────────
+const DB = {
+    async set(col, id, data) {
+        if (dbMode === 'firebase' && firestoreDb) {
+            try { await firestoreDb.collection(col).doc(id).set(data); return; } catch(e) { console.warn('Firestore write failed, using local', e); }
         }
+        const store = JSON.parse(localStorage.getItem(col) || '{}');
+        store[id] = data;
+        localStorage.setItem(col, JSON.stringify(store));
+    },
+    async add(col, data) {
+        if (dbMode === 'firebase' && firestoreDb) {
+            try { await firestoreDb.collection(col).add(data); return; } catch(e) { console.warn('Firestore add failed, using local', e); }
+        }
+        const store = JSON.parse(localStorage.getItem(col) || '[]');
+        store.unshift(data);
+        localStorage.setItem(col, JSON.stringify(store.slice(0, 50)));
+    },
+    async getDoc(col, id) {
+        if (dbMode === 'firebase' && firestoreDb) {
+            try { const d = await firestoreDb.collection(col).doc(id).get(); return d.exists ? d.data() : null; } catch(e) { /* fallthrough */ }
+        }
+        const store = JSON.parse(localStorage.getItem(col) || '{}');
+        return store[id] || null;
+    },
+    async getAll(col) {
+        if (dbMode === 'firebase' && firestoreDb) {
+            try {
+                const snap = await firestoreDb.collection(col).get();
+                const results = [];
+                snap.forEach(d => {
+                    const data = d.data();
+                    if (data.timestamp && data.timestamp.toDate) data.timestamp = data.timestamp.toDate().toISOString();
+                    results.push(data);
+                });
+                return results;
+            } catch(e) { /* fallthrough */ }
+        }
+        const raw = localStorage.getItem(col);
+        if (!raw) return [];
+        try {
+            const parsed = JSON.parse(raw);
+            // Support both object and array storage formats
+            if (Array.isArray(parsed)) return parsed;
+            return Object.values(parsed);
+        } catch { return []; }
+    },
+    async clearAll() {
+        ['webauthn_credentials', 'boot_baselines', 'attestation_logs'].forEach(col => localStorage.removeItem(col));
+        if (dbMode === 'firebase' && firestoreDb) {
+            try {
+                for (const col of ['webauthn_credentials', 'boot_baselines', 'attestation_logs']) {
+                    const snap = await firestoreDb.collection(col).get();
+                    const batch = firestoreDb.batch();
+                    snap.forEach(d => batch.delete(d.ref));
+                    await batch.commit();
+                }
+            } catch(e) { console.warn(e); }
+        }
+    }
+};
 
-        // Parse Attested Credential Data
-        // Offset 37: AAGUID (16 bytes)
-        // Offset 53: Credential ID Length (2 bytes)
-        const credIdLength = view.getUint16(53);
-        const credId = authData.slice(55, 55 + credIdLength);
-        const pubKeyBytes = authData.slice(55 + credIdLength);
-
-        logCrypto(`Extracted Credential ID: ${bufferToHex(credId).substring(0, 16)}...`, "data");
-
-        // Parse Public Key map from COSE format (CBOR)
-        const coseKeyMap = decodeCBOR(pubKeyBytes.buffer);
-        
-        // Key types: 1 = kty, 3 = alg, -1 = crv, -2 = x, -3 = y
-        const kty = coseKeyMap.get(1);
-        const alg = coseKeyMap.get(3);
-        const crv = coseKeyMap.get(-1);
-        const xBytes = coseKeyMap.get(-2);
-        const yBytes = coseKeyMap.get(-3);
-
-        logCrypto(`Extracted COSE Public Key: Type=${kty}, Alg=${alg}, Curve=${crv}`, "info");
-
-        // Map COSE Elliptic Curve key parameters to standard JWK (JSON Web Key)
-        const jwkPublicKey = {
-            kty: "EC",
-            crv: "P-256",
-            x: bufferToBase64url(xBytes),
-            y: bufferToBase64url(yBytes),
-            ext: true
-        };
-
-        logCrypto(`Generated Public JWK for Database: ${JSON.stringify(jwkPublicKey).substring(0, 50)}...`, "data");
-
-        // Store credential in database
-        const credRecord = {
-            username: username,
-            credentialId: bufferToBase64url(credId),
-            publicKeyJwk: jwkPublicKey,
-            signCount: signCount,
-            registeredAt: new Date().toISOString()
-        };
-
-        await DbService.addCredential(credRecord);
-        logCrypto(`Public Key and Credential saved successfully to database!`, "success");
-        
-        // Show status
-        document.getElementById("auth-status-card").style.display = "block";
-        document.getElementById("auth-status-title").innerText = "Hardware Registered!";
-        document.getElementById("auth-status-title").style.color = "var(--clr-emerald)";
-        document.getElementById("auth-status-body").innerText = `Successfully linked biometric/security key for: "${username}"`;
-
-        // Refresh Database Explorer
-        if (currentTab === "database") renderDbExplorer();
-
-    } catch (err) {
-        logCrypto(`Registration Failed: ${err.message}`, "error");
-        console.error(err);
+// ── Firebase Initialization ───────────────────
+function connectFirebase(config) {
+    try {
+        if (firebase.apps.length) firebase.app().delete();
+        firebase.initializeApp(config);
+        firestoreDb = firebase.firestore();
+        dbMode = 'firebase';
+        localStorage.setItem('fb_config', JSON.stringify(config));
+        updateDbUI(true, config.projectId);
+    } catch(e) {
+        alert('Firebase connection failed: ' + e.message);
+        setLocalMode();
     }
 }
 
-// WebAuthn Authentication (Login) Action
-async function handleWebAuthnLogin() {
-    const username = document.getElementById("auth-username").value.trim();
-    if (!username) {
-        alert("Please enter a username.");
+function setLocalMode() {
+    dbMode = 'local'; firestoreDb = null;
+    localStorage.removeItem('fb_config');
+    updateDbUI(false);
+}
+
+function updateDbUI(connected, pid = '') {
+    const dot  = document.getElementById('db-dot');
+    const text = document.getElementById('db-pill-text');
+    const cap  = document.getElementById('cap-db');
+    if (connected) {
+        dot.className = 'db-dot connected';
+        text.textContent = `Firestore: ${pid}`;
+        cap.textContent = 'Firestore'; cap.className = 'cap-badge active';
+    } else {
+        dot.className = 'db-dot';
+        text.textContent = 'Local Mock DB';
+        cap.textContent = 'Local'; cap.className = 'cap-badge warning';
+    }
+}
+
+function tryLoadSavedFirebase() {
+    const saved = localStorage.getItem('fb_config');
+    if (saved) {
+        try { connectFirebase(JSON.parse(saved)); return; } catch(e) { /* */ }
+    }
+    setLocalMode();
+}
+
+// ── WebAuthn ──────────────────────────────────
+async function doRegister() {
+    const username = document.getElementById('auth-username').value.trim();
+    if (!username) { alert('Enter a username.'); return; }
+
+    clog(`Starting registration for "${username}"`, 'system');
+
+    if (!window.isSecureContext) {
+        clog('ERROR: WebAuthn requires a secure context (localhost or https://).', 'error');
+        return;
+    }
+    if (!navigator.credentials?.create) {
+        clog('ERROR: WebAuthn not supported in this browser.', 'error');
         return;
     }
 
-    logCrypto(`Initiating challenge-response login for user: "${username}"`, "system");
+    try {
+        const challenge = crypto.getRandomValues(new Uint8Array(32));
+        clog(`Generated challenge: ${bufToHex(challenge).slice(0, 16)}...`, 'info');
+
+        const cred = await navigator.credentials.create({
+            publicKey: {
+                challenge,
+                rp: { name: 'Hardware Root of Trust Demo', id: location.hostname },
+                user: { id: new TextEncoder().encode(username), name: username, displayName: username },
+                pubKeyCredParams: [{ type: 'public-key', alg: -7 }],
+                timeout: 60000,
+                attestation: 'none',
+                authenticatorSelection: { userVerification: 'preferred' }
+            }
+        });
+
+        clog('Hardware credential created! Parsing authenticator data...', 'success');
+
+        const decoded = parseCBOR(cred.response.attestationObject);
+        const authData = decoded.get('authData');
+        clog(`clientDataJSON: ${new TextDecoder().decode(cred.response.clientDataJSON)}`, 'data');
+
+        const flags = authData[32];
+        const signCount = new DataView(authData.buffer, authData.byteOffset).getUint32(33);
+        clog(`Flags → UP:${!!(flags & 0x01)} UV:${!!(flags & 0x04)} AT:${!!(flags & 0x40)}`, 'info');
+        clog(`Signature counter: ${signCount}`, 'info');
+
+        if (!(flags & 0x40)) throw new Error('No attested credential data in authData');
+
+        const credIdLen = new DataView(authData.buffer, authData.byteOffset).getUint16(53);
+        const credId = authData.slice(55, 55 + credIdLen);
+        const pubKeyBytes = authData.slice(55 + credIdLen);
+        const coseKey = parseCBOR(pubKeyBytes.buffer);
+
+        const x = coseKey.get(-2), y = coseKey.get(-3);
+        const jwk = { kty: 'EC', crv: 'P-256', x: bufToB64u(x), y: bufToB64u(y), ext: true };
+
+        clog(`Public Key JWK x: ${jwk.x.slice(0, 12)}... y: ${jwk.y.slice(0, 12)}...`, 'data');
+
+        const record = { username, credentialId: bufToB64u(credId), publicKeyJwk: jwk, signCount, registeredAt: new Date().toISOString() };
+        await DB.set('webauthn_credentials', username, record);
+
+        clog(`Credential stored in database successfully!`, 'success');
+        showAuthResult('Registration Successful!', `Hardware key bound for "${username}". Public key saved to database.`, 'var(--green)');
+
+    } catch(e) {
+        clog(`Registration failed: ${e.message}`, 'error');
+    }
+}
+
+async function doLogin() {
+    const username = document.getElementById('auth-username').value.trim();
+    if (!username) { alert('Enter a username.'); return; }
+
+    clog(`Starting hardware authentication for "${username}"`, 'system');
 
     try {
-        // Step 1: Look up registered credential in DB
-        const credRecord = await DbService.getCredential(username);
-        if (!credRecord) {
-            logCrypto(`ERROR: No registered hardware credential found for "${username}". Register first!`, "error");
-            alert("No user found with that name. Please Register the hardware first.");
+        const record = await DB.getDoc('webauthn_credentials', username);
+        if (!record) {
+            clog(`ERROR: No credential found for "${username}". Register first.`, 'error');
+            alert(`No credential registered for "${username}". Please register first.`);
             return;
         }
 
-        logCrypto(`Found credential ID: ${credRecord.credentialId.substring(0, 16)}...`, "info");
+        clog(`Found credential ID: ${record.credentialId.slice(0, 16)}...`, 'info');
+        const challenge = crypto.getRandomValues(new Uint8Array(32));
 
-        // Step 2: Generate unique verification challenge
-        const challengeBuffer = new Uint8Array(32);
-        window.crypto.getRandomValues(challengeBuffer);
-        
-        const loginOptions = {
+        const assertion = await navigator.credentials.get({
             publicKey: {
-                challenge: challengeBuffer,
-                allowCredentials: [{
-                    id: base64urlToBuffer(credRecord.credentialId),
-                    type: "public-key"
-                }],
+                challenge,
+                allowCredentials: [{ id: b64uToBuf(record.credentialId), type: 'public-key' }],
                 timeout: 60000,
-                userVerification: "preferred"
+                userVerification: 'preferred'
             }
-        };
+        });
 
-        logCrypto("Calling navigator.credentials.get(). TPM/Enclave signing challenge...", "system");
-        
-        // Step 3: Hardware sign prompt
-        const assertion = await navigator.credentials.get(loginOptions);
-        logCrypto("Assertion signature received from hardware! Initiating verification...", "success");
+        clog('Assertion received from hardware! Verifying signature...', 'success');
 
-        const response = assertion.response;
-        const authenticatorData = new Uint8Array(response.authenticatorData);
-        const clientDataJSON = response.clientDataJSON;
-        const signatureDer = response.signature;
+        const { authenticatorData, clientDataJSON, signature } = assertion.response;
+        clog(`clientDataJSON: ${new TextDecoder().decode(clientDataJSON)}`, 'data');
+        clog(`Signature (DER): ${bufToHex(signature).slice(0, 24)}...`, 'data');
 
-        logCrypto(`Decoded Client Data JSON: ${new TextDecoder().decode(clientDataJSON)}`, "data");
-        logCrypto(`Received Signature (DER format): ${bufferToHex(signatureDer).substring(0, 30)}...`, "data");
+        const clientHash = await sha256(clientDataJSON);
+        const authDataBytes = new Uint8Array(authenticatorData);
+        const verifyBuf = new Uint8Array(authDataBytes.length + 32);
+        verifyBuf.set(authDataBytes);
+        verifyBuf.set(new Uint8Array(clientHash), authDataBytes.length);
 
-        // Step 4: Cryptographic Verification (Simulated remote verification using WebCrypto)
-        logCrypto("Verifying signed challenge signature...", "system");
+        const cryptoKey = await crypto.subtle.importKey('jwk', record.publicKeyJwk, { name: 'ECDSA', namedCurve: 'P-256' }, true, ['verify']);
+        const rawSig = derToRaw(signature);
 
-        // Hash the clientDataJSON
-        const clientDataHash = await window.crypto.subtle.digest("SHA-256", clientDataJSON);
+        const ok = await crypto.subtle.verify({ name: 'ECDSA', hash: { name: 'SHA-256' } }, cryptoKey, rawSig, verifyBuf);
 
-        // Concatenate authenticatorData + SHA256(clientDataJSON) to form the signed message buffer
-        const verifyData = new Uint8Array(authenticatorData.length + 32);
-        verifyData.set(authenticatorData, 0);
-        verifyData.set(new Uint8Array(clientDataHash), authenticatorData.length);
-
-        // Import the JWK public key
-        const cryptoKey = await window.crypto.subtle.importKey(
-            "jwk",
-            credRecord.publicKeyJwk,
-            { name: "ECDSA", namedCurve: "P-256" },
-            true,
-            ["verify"]
-        );
-
-        // Convert DER format signature to raw IEEE signature for WebCrypto
-        const rawSignature = derToRaw(signatureDer);
-
-        // Perform signature verification
-        const isVerified = await window.crypto.subtle.verify(
-            { name: "ECDSA", hash: { name: "SHA-256" } },
-            cryptoKey,
-            rawSignature,
-            verifyData
-        );
-
-        if (isVerified) {
-            logCrypto("CRYPTOGRAPHIC VERIFICATION SUCCESS! Hardware signature validates perfectly.", "success");
-            
-            // Extract and update Signature counter to prevent replay attacks
-            const view = new DataView(authenticatorData.buffer);
-            const newSignCount = view.getUint32(33);
-            logCrypto(`New Signature Count: ${newSignCount} (Previous: ${credRecord.signCount})`, "info");
-            
-            credRecord.signCount = newSignCount;
-            await DbService.addCredential(credRecord); // update record counter
-
-            // Show status
-            document.getElementById("auth-status-card").style.display = "block";
-            document.getElementById("auth-status-title").innerText = "Authentication Passed!";
-            document.getElementById("auth-status-title").style.color = "var(--clr-cyan)";
-            document.getElementById("auth-status-body").innerText = `Verified TPM Hardware key signature for: "${username}"`;
+        if (ok) {
+            const newCount = new DataView(authenticatorData).getUint32(33);
+            clog(`SIGNATURE VERIFIED ✓ — New counter: ${newCount}`, 'success');
+            record.signCount = newCount;
+            await DB.set('webauthn_credentials', username, record);
+            showAuthResult('Authentication Passed ✓', `TPM hardware signature cryptographically verified for "${username}".`, 'var(--cyan)');
         } else {
-            logCrypto("CRYPTOGRAPHIC VERIFICATION FAILURE! Signature check failed.", "error");
-            throw new Error("WebCrypto signature verification failed");
+            clog('VERIFICATION FAILED — Signature mismatch!', 'error');
+            throw new Error('Signature verification failed');
         }
-
-    } catch (err) {
-        logCrypto(`Authentication Failed: ${err.message}`, "error");
-        console.error(err);
+    } catch(e) {
+        clog(`Authentication failed: ${e.message}`, 'error');
     }
 }
 
-
-// ==================== MEASURED BOOT SIMULATOR ====================
-
-// Renders the list of boot stages and whether they have been altered
-function renderBootLoaderChain() {
-    const container = document.getElementById("boot-chain-container");
-    if (!container) return;
-
-    container.innerHTML = "";
-    bootComponents.forEach(comp => {
-        const card = document.createElement("div");
-        card.className = `boot-node-card ${comp.tampered ? 'tampered' : 'secure'}`;
-        card.innerHTML = `
-            <div class="boot-node-index">${comp.id}</div>
-            <div class="boot-node-info">
-                <div class="boot-node-name">
-                    ${comp.name} 
-                    <span class="badge ${comp.tampered ? 'badge-tampered' : 'badge-secure'}">
-                        ${comp.tampered ? 'Tampered' : 'Intact'}
-                    </span>
-                </div>
-                <div class="boot-node-hash">
-                    File: <code>${comp.file}</code> | Hash: <code>${comp.hash.substring(0, 16)}...</code>
-                </div>
-                <p style="margin: 0.25rem 0 0 0; font-size: 0.75rem; color: #64748b;">${comp.desc}</p>
-            </div>
-            <div class="boot-node-actions">
-                <button class="btn ${comp.tampered ? 'btn-cyan' : 'btn-red'} btn-sm" onclick="toggleTamper(${comp.id})">
-                    ${comp.tampered ? 'Restore Clean' : 'Tamper Code'}
-                </button>
-            </div>
-        `;
-        container.appendChild(card);
-    });
+function showAuthResult(title, body, color) {
+    const card = document.getElementById('auth-result');
+    document.getElementById('auth-result-title').style.color = color;
+    document.getElementById('auth-result-title').textContent = title;
+    document.getElementById('auth-result-body').textContent = body;
+    card.style.display = 'block';
 }
 
-// Toggle malware tamper inject state on a boot module
+// ── Boot Chain Rendering ──────────────────────
+function renderBootChain() {
+    const el = document.getElementById('boot-chain');
+    if (!el) return;
+    el.innerHTML = bootComponents.map(c => `
+        <div class="boot-node ${c.tampered ? 'tampered' : 'secure'}" id="boot-node-${c.id}">
+            <div class="boot-idx">${c.id}</div>
+            <div class="boot-info">
+                <div class="boot-name">
+                    ${esc(c.name)}
+                    <span class="badge ${c.tampered ? 'badge-bad' : 'badge-ok'}">${c.tampered ? 'Tampered' : 'Intact'}</span>
+                </div>
+                <div class="boot-hash">File: ${esc(c.file)} | Hash: ${esc(c.tampered ? c.hash.slice(0,8) + '...[CORRUPTED]' : c.baseHash.slice(0,12) + '...')}</div>
+            </div>
+            <button class="btn ${c.tampered ? 'btn-outline' : 'btn-danger'} btn-sm" onclick="toggleTamper(${c.id})">
+                ${c.tampered ? 'Restore' : 'Tamper'}
+            </button>
+        </div>
+    `).join('');
+}
+
 function toggleTamper(id) {
-    const comp = bootComponents.find(c => c.id === id);
-    if (!comp) return;
-
-    comp.tampered = !comp.tampered;
-    if (comp.tampered) {
-        // Compute corrupted hash (Appended malicious code string)
-        comp.hash = "deadbeef" + comp.hash.substring(8);
-    } else {
-        // Restore default clean baseline hash
-        const defaults = {
-            0: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-            1: "4a0c8b6b1df40003058a983ef1de4efc0aa637dd38e0797de899a19d9b626e83",
-            2: "f3c2b87d091e2b34a6e8df81c8ea3c4f901abde205c083ba4e6b12a3d02cfbb2",
-            3: "a8b9c0d1e2f30415263748596a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b",
-            4: "1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c"
-        };
-        comp.hash = defaults[id];
-    }
-    renderBootLoaderChain();
+    const c = bootComponents.find(x => x.id === id);
+    if (!c) return;
+    c.tampered = !c.tampered;
+    c.hash = c.tampered ? 'deadbeef' + c.baseHash.substring(8) : c.baseHash;
+    renderBootChain();
+    evaluateSafeState();
 }
 
-function renderPcrRegisters() {
-    const container = document.getElementById("pcr-grid-container");
-    if (!container) return;
-
-    container.innerHTML = "";
-    Object.keys(pcrRegisters).forEach(num => {
-        const row = document.createElement("div");
-        row.className = "pcr-row";
-        row.innerHTML = `
+// ── PCR Rendering ─────────────────────────────
+function renderPCRTable() {
+    const el = document.getElementById('pcr-table');
+    if (!el) return;
+    el.innerHTML = Object.keys(pcrRegisters).map(num => `
+        <div class="pcr-row">
             <span class="pcr-num">PCR-${num}:</span>
-            <span class="pcr-val" id="pcr-val-${num}">${pcrRegisters[num]}</span>
-        `;
-        container.appendChild(row);
-    });
+            <span class="pcr-val" id="pcrval-${num}">${pcrRegisters[num]}</span>
+        </div>
+    `).join('');
 }
 
-// Executes Measured Boot in TPM
-// Updates PCR values with PCR_new = SHA256(PCR_old || Hash(Component))
+function setPCRUI(num, val, state) {
+    const el = document.getElementById(`pcrval-${num}`);
+    if (!el) return;
+    el.textContent = val;
+    el.className = `pcr-val ${state}`;
+    setTimeout(() => el.className = 'pcr-val', 800);
+}
+
+// ── Measured Boot Execution ───────────────────
 async function runMeasuredBoot() {
-    document.getElementById("btn-simulate-boot").disabled = true;
-    
-    // Reset PCRs to Zeros
-    const zeroPcr = "0000000000000000000000000000000000000000000000000000000000000000";
-    Object.keys(pcrRegisters).forEach(k => pcrRegisters[k] = zeroPcr);
-    renderPcrRegisters();
+    const btnBoot = document.getElementById('btn-boot');
+    btnBoot.disabled = true;
 
-    // Mapping components to PCRs:
-    // ROM (0) -> PCR 0
-    // UEFI (1) -> PCR 0
-    // GRUB (2) -> PCR 4
-    // Kernel (3) -> PCR 8
-    // Daemon (4) -> PCR 9
-    const pcrMapping = {
-        0: 0,
-        1: 0,
-        2: 4,
-        3: 8,
-        4: 9
-    };
+    // Reset PCRs
+    Object.keys(pcrRegisters).forEach(k => pcrRegisters[k] = ZERO_PCR);
+    renderPCRTable();
+    setAttestUI('neutral', 'Running Measured Boot…', 'Extending PCR registers with component measurements…');
 
-    const cardStatus = document.getElementById("attestation-result-card");
-    const title = document.getElementById("attest-status-header");
-    const desc = document.getElementById("attest-status-desc");
-    
-    title.innerHTML = '<i data-lucide="loader" style="vertical-align:middle; animation: spin 2s linear infinite;"></i> Running Measured Boot...';
-    desc.innerText = "TPM is measuring components sequentially and extending PCR values...";
-    lucide.createIcons();
-
-    // Sequentially measure components with visual delay
     for (const comp of bootComponents) {
-        const targetPcr = pcrMapping[comp.id];
-        
-        // Highlight active component in UI
-        const nodes = document.querySelectorAll(".boot-node-card");
-        nodes[comp.id].style.borderColor = "var(--clr-cyan)";
-        nodes[comp.id].style.boxShadow = "0 0 10px var(--clr-cyan-glow)";
-
-        await new Promise(resolve => setTimeout(resolve, 800));
-
-        // Get current PCR value
-        const currentPcrVal = pcrRegisters[targetPcr];
-        
-        // Concat current PCR hex + component hash hex
-        const concatString = currentPcrVal + comp.hash;
-        
-        // SHA-256 of concatenated string
-        const newHashBuffer = await sha256(concatString);
-        const newPcrHex = bufferToHex(newHashBuffer);
-        
-        // Update state
-        pcrRegisters[targetPcr] = newPcrHex;
-        
-        // Update UI row with highlight
-        const pcrValEl = document.getElementById(`pcr-val-${targetPcr}`);
-        if (pcrValEl) {
-            pcrValEl.innerText = newPcrHex;
-            pcrValEl.style.color = "var(--clr-cyan)";
-            pcrValEl.style.boxShadow = "0 0 10px var(--clr-cyan-glow)";
-            setTimeout(() => {
-                pcrValEl.style.boxShadow = "none";
-                if (comp.tampered) pcrValEl.style.color = "var(--clr-red)";
-                else pcrValEl.style.color = "#94a3b8";
-            }, 600);
-        }
-
-        // Restore node styling
-        nodes[comp.id].style.borderColor = comp.tampered ? "var(--clr-red)" : "var(--border-color)";
-        nodes[comp.id].style.boxShadow = "none";
+        await delay(700);
+        const concat = pcrRegisters[comp.pcrTarget] + (comp.tampered ? comp.hash : comp.baseHash);
+        pcrRegisters[comp.pcrTarget] = await sha256hex(concat);
+        setPCRUI(comp.pcrTarget, pcrRegisters[comp.pcrTarget], comp.tampered ? 'tampered' : 'updated');
     }
 
-    title.innerHTML = '<i data-lucide="check-circle" style="vertical-align:middle; color:var(--clr-emerald);"></i> Measured Boot Completed';
-    desc.innerText = "System boot state securely written to TPM PCR registers. Ready for attestation query.";
-    document.getElementById("btn-simulate-boot").disabled = false;
-    lucide.createIcons();
-
-    // Try unsealing storage if active
-    evaluateSealedStorageState();
+    setAttestUI('neutral', 'Boot Sequence Complete', 'PCR values locked in TPM. Click "Run Attestation" to verify integrity.');
+    document.getElementById('btn-save-baseline').style.display = 'none';
+    btnBoot.disabled = false;
+    evaluateSafeState();
 }
 
-// Remote Attestation Logic
-async function handleRemoteAttestation() {
-    const title = document.getElementById("attest-status-header");
-    const desc = document.getElementById("attest-status-desc");
-    const actionBlock = document.getElementById("attest-baseline-actions");
+// ── Remote Attestation ────────────────────────
+async function runAttestation() {
+    setAttestUI('neutral', 'Fetching baselines…', 'Querying database for golden PCR measurements…');
+    await delay(800);
 
-    title.innerHTML = '<i data-lucide="loader" style="vertical-align:middle; animation: spin 2s linear infinite;"></i> Fetching baseline & verifying...';
-    desc.innerText = "Querying Database for reference golden PCR measurements...";
-    lucide.createIcons();
-
-    await new Promise(r => setTimeout(r, 1000));
-
-    // Fetch Golden baselines
-    const baselineRecords = await DbService.getBaselines();
-    
-    // If no baselines exist in Database, offer to save current boot
-    if (baselineRecords.length === 0) {
-        title.innerHTML = '<i data-lucide="alert-triangle" style="color:var(--clr-amber); vertical-align:middle;"></i> Baselines Empty';
-        desc.innerText = "No integrity baselines are set in Firestore. Please click below to trust and save the current boot configuration as your baseline.";
-        actionBlock.style.display = "block";
-        lucide.createIcons();
+    const baselines = await DB.getAll('boot_baselines');
+    if (!baselines.length) {
+        setAttestUI('warn', 'No Baselines Stored', 'No golden baseline exists. Save the current clean boot as your baseline first.');
+        document.getElementById('btn-save-baseline').style.display = 'flex';
         return;
     }
 
-    // Map the baseline array back to object
-    const baselines = {};
-    baselineRecords.forEach(b => baselines[b.name] = b.hash);
+    const baseMap = {};
+    baselines.forEach(b => baseMap[b.name] = b.hash);
 
-    let systemCompromised = false;
-    let errorDetail = "";
-    
-    // Compare each current boot component to its baseline
+    let compromised = false, detail = '';
     for (const comp of bootComponents) {
-        const baselineHash = baselines[comp.name];
-        if (!baselineHash) continue;
-
-        if (comp.hash !== baselineHash) {
-            systemCompromised = true;
-            errorDetail = `Component "${comp.name}" hash mismatch! Expected: ${baselineHash.substring(0, 12)}..., Got: ${comp.hash.substring(0, 12)}...`;
+        const expected = baseMap[comp.name];
+        if (!expected) continue;
+        const actual = comp.tampered ? comp.hash : comp.baseHash;
+        if (actual !== expected) {
+            compromised = true;
+            detail = `"${comp.name}" mismatch. Expected: ${expected.slice(0,12)}… Got: ${actual.slice(0,12)}…`;
             break;
         }
     }
 
-    const timestamp = new Date().toISOString();
-    const logEntry = {
-        timestamp: timestamp,
-        status: systemCompromised ? "Compromised" : "Secure",
-        details: systemCompromised ? errorDetail : "All boot measurements match baseline hashes perfectly."
-    };
+    const log = { timestamp: new Date().toISOString(), status: compromised ? 'Compromised' : 'Secure', details: compromised ? detail : 'All measurements match golden baselines.' };
+    await DB.add('attestation_logs', log);
 
-    // Log to Firebase/LocalDB
-    await DbService.addAttestationLog(logEntry);
-
-    if (systemCompromised) {
-        title.innerHTML = '<i data-lucide="shield-alert" style="color:var(--clr-red); vertical-align:middle;"></i> ATTESTATION FAILED: COMPROMISED';
-        title.style.color = "var(--clr-red)";
-        desc.innerHTML = `<strong style="color:#ffffff;">Threat Detected:</strong> ${errorDetail}<br><span style="font-size:0.8rem; color:#64748b;">Report logged in audit log.</span>`;
-        actionBlock.style.display = "block"; // allow overwriting baseline if user wants
+    if (compromised) {
+        setAttestUI('bad', '⚠ ATTESTATION FAILED — SYSTEM COMPROMISED', detail + ' Event logged.');
+        document.getElementById('btn-save-baseline').style.display = 'none';
     } else {
-        title.innerHTML = '<i data-lucide="shield-check" style="color:var(--clr-emerald); vertical-align:middle;"></i> ATTESTATION PASSED: SECURE';
-        title.style.color = "var(--clr-emerald)";
-        desc.innerText = "Cryptographic report validates system integrity. Firmware, bootloader, kernel, and daemons are pristine.";
-        actionBlock.style.display = "none";
+        setAttestUI('good', '✓ ATTESTATION PASSED — SYSTEM SECURE', 'All boot measurements match golden baselines perfectly.');
+        document.getElementById('btn-save-baseline').style.display = 'none';
     }
-    
-    lucide.createIcons();
-    if (currentTab === "database") renderDbExplorer();
+
+    if (currentTab === 'database') renderDbExplorer();
 }
 
-// Saves current boot states as reference baselines in database
-async function saveCurrentAsGoldenBaseline() {
-    if (confirm("Are you sure you want to trust the current boot state and save it as the Golden Baseline?")) {
-        const baselines = bootComponents.map(c => ({
-            name: c.name,
-            hash: c.hash
-        }));
-        await DbService.saveBaselines(baselines);
-        alert("Pristine baseline configuration saved successfully in database!");
-        
-        // Hide baseline actions and run attestation again
-        document.getElementById("attest-baseline-actions").style.display = "none";
-        handleRemoteAttestation();
-    }
+function setAttestUI(type, title, desc) {
+    const titleEl = document.getElementById('attest-title');
+    const descEl  = document.getElementById('attest-desc');
+    const iconEl  = document.getElementById('attest-result')?.querySelector('.attest-icon');
+    const colors = { good: 'var(--green)', bad: 'var(--red)', warn: 'var(--amber)', neutral: 'var(--text-muted)' };
+    titleEl.style.color = colors[type];
+    titleEl.textContent = title;
+    descEl.textContent = desc;
 }
 
-// Reset Boot Components
+async function saveGoldenBaseline() {
+    if (!confirm('Trust current boot state and save as golden baseline?')) return;
+    for (const comp of bootComponents) {
+        await DB.set('boot_baselines', comp.name, { name: comp.name, hash: comp.baseHash });
+    }
+    alert('Golden baseline saved!');
+    document.getElementById('btn-save-baseline').style.display = 'none';
+    runAttestation();
+}
+
 function resetBootChain() {
-    bootComponents.forEach(comp => comp.tampered = false);
-    // Restore default clean hashes
-    const defaults = {
-        0: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        1: "4a0c8b6b1df40003058a983ef1de4efc0aa637dd38e0797de899a19d9b626e83",
-        2: "f3c2b87d091e2b34a6e8df81c8ea3c4f901abde205c083ba4e6b12a3d02cfbb2",
-        3: "a8b9c0d1e2f30415263748596a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b",
-        4: "1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c"
-    };
-    bootComponents.forEach(c => c.hash = defaults[c.id]);
-    renderBootLoaderChain();
-    
-    // Reset PCRs
-    const zeroPcr = "0000000000000000000000000000000000000000000000000000000000000000";
-    Object.keys(pcrRegisters).forEach(k => pcrRegisters[k] = zeroPcr);
-    renderPcrRegisters();
-
-    document.getElementById("attest-status-header").innerHTML = '<i data-lucide="help-circle" style="vertical-align:middle;"></i> Attestation Status: Waiting for Boot';
-    document.getElementById("attest-status-header").style.color = "var(--clr-cyan)";
-    document.getElementById("attest-status-desc").innerText = "Execute Measured Boot and run Remote Attestation to query server integrity validation.";
-    document.getElementById("attest-baseline-actions").style.display = "none";
-    lucide.createIcons();
-
-    evaluateSealedStorageState();
+    bootComponents.forEach(c => { c.tampered = false; c.hash = c.baseHash; });
+    Object.keys(pcrRegisters).forEach(k => pcrRegisters[k] = ZERO_PCR);
+    renderBootChain();
+    renderPCRTable();
+    setAttestUI('neutral', 'Attestation: Awaiting Boot', 'Execute boot sequence then run attestation to verify integrity.');
+    document.getElementById('btn-save-baseline').style.display = 'none';
+    evaluateSafeState();
 }
 
-// ==================== SEALED STORAGE SIMULATOR ====================
+// ── Sealed Storage ────────────────────────────
+async function getPolicyHash(pcrs) {
+    const concat = pcrs.map(p => pcrRegisters[p]).join('');
+    return sha256hex(concat);
+}
 
-// Computes a composite cryptographic hash representing the policy state of selected PCRs
-async function getSelectedPcrPolicyHash(selectionList) {
-    let concatString = "";
-    selectionList.forEach(pcrNum => {
-        concatString += pcrRegisters[pcrNum];
+async function sealKey() {
+    const secret = document.getElementById('seal-input').value.trim();
+    if (!secret) { alert('Enter a secret payload.'); return; }
+
+    const sel = [];
+    if (document.getElementById('seal-pcr0').checked) sel.push(0);
+    if (document.getElementById('seal-pcr4').checked) sel.push(4);
+    if (document.getElementById('seal-pcr8').checked) sel.push(8);
+    if (document.getElementById('seal-pcr9').checked) sel.push(9);
+
+    if (!sel.length) { alert('Select at least one PCR register.'); return; }
+
+    const hash = await getPolicyHash(sel);
+    sealedStore = { secret, pcrSelection: sel, targetPolicyHash: hash };
+    localStorage.setItem('sealed_store', JSON.stringify(sealedStore));
+
+    setSafeUI('sealed', 'TPM KEY SEALED', `Key bound to PCRs [${sel.join(', ')}]. TPM will deny access if registers change.`);
+    document.getElementById('payload-reveal').style.display = 'none';
+    alert('Key sealed! Try tampering with boot components, then attempt to unseal.');
+}
+
+async function unsealKey() {
+    if (!sealedStore.secret) { alert('No key is sealed. Seal a secret first.'); return; }
+
+    const currentHash = await getPolicyHash(sealedStore.pcrSelection);
+
+    if (currentHash === sealedStore.targetPolicyHash) {
+        setSafeUI('unlocked', 'UNSEAL SUCCESSFUL', 'PCR states verified. TPM released the decryption key.');
+        document.getElementById('payload-value').textContent = sealedStore.secret;
+        document.getElementById('payload-reveal').style.display = 'block';
+    } else {
+        setSafeUI('compromised', 'ACCESS DENIED: PCR MISMATCH', 'Hardware TPM refuses release. Platform configuration registers do not match sealed policy.');
+        document.getElementById('payload-reveal').style.display = 'none';
+    }
+}
+
+function setSafeUI(state, title, desc) {
+    const icon = document.getElementById('safe-icon');
+    const stEl = document.getElementById('safe-status');
+    const dEl  = document.getElementById('safe-desc');
+    icon.className = `safe-icon ${state}`;
+    stEl.className = `safe-status ${state}`;
+    stEl.textContent = title;
+    dEl.textContent  = desc;
+}
+
+async function evaluateSafeState() {
+    if (!sealedStore.secret) return;
+    const currentHash = await getPolicyHash(sealedStore.pcrSelection);
+    if (currentHash === sealedStore.targetPolicyHash) {
+        setSafeUI('sealed', 'TPM KEY SEALED', 'Current PCR state matches sealed policy. Ready to unseal.');
+        document.getElementById('safe-icon').className = 'safe-icon';
+    } else {
+        setSafeUI('compromised', 'INTEGRITY FAULT', 'Boot registers diverge from sealed policy. Decryption locked.');
+        document.getElementById('payload-reveal').style.display = 'none';
+    }
+}
+
+// ── Database Explorer ─────────────────────────
+async function renderDbExplorer() {
+    // Credentials
+    const creds = await DB.getAll('webauthn_credentials');
+    const credBody = document.getElementById('tbl-credentials');
+    credBody.innerHTML = creds.length ? creds.map(c => `
+        <tr>
+            <td><strong>${esc(c.username)}</strong></td>
+            <td><code>${esc((c.credentialId || '').slice(0, 16))}…</code></td>
+            <td><code>x:${esc((c.publicKeyJwk?.x || '').slice(0, 8))}…</code></td>
+            <td>${new Date(c.registeredAt).toLocaleString()}</td>
+        </tr>
+    `).join('') : '<tr><td colspan="4" class="empty-cell">No credentials registered.</td></tr>';
+
+    // Baselines
+    const bases = await DB.getAll('boot_baselines');
+    const baseBody = document.getElementById('tbl-baselines');
+    baseBody.innerHTML = bases.length ? bases.map(b => `
+        <tr>
+            <td><strong>${esc(b.name)}</strong></td>
+            <td><code>${esc(b.hash)}</code></td>
+        </tr>
+    `).join('') : '<tr><td colspan="2" class="empty-cell">No baselines saved.</td></tr>';
+
+    // Logs
+    const logs = await DB.getAll('attestation_logs');
+    const logsBody = document.getElementById('tbl-logs');
+    logsBody.innerHTML = logs.length ? logs.map(l => `
+        <tr>
+            <td>${new Date(l.timestamp).toLocaleTimeString()}</td>
+            <td><span class="badge ${l.status === 'Secure' ? 'badge-ok' : 'badge-bad'}">${esc(l.status)}</span></td>
+            <td style="font-size:0.75rem;">${esc(l.details)}</td>
+        </tr>
+    `).join('') : '<tr><td colspan="3" class="empty-cell">No attestation events.</td></tr>';
+}
+
+// ── Tab Navigation ────────────────────────────
+const PAGE_TITLES = {
+    dashboard: 'Root of Trust Control Center',
+    webauthn:  'WebAuthn Hardware Authentication',
+    boot:      'Measured Boot & Remote Attestation',
+    sealed:    'TPM Sealed Storage Simulator',
+    database:  'Database Explorer'
+};
+
+function switchTab(id) {
+    document.querySelectorAll('.nav-btn').forEach(b => b.classList.toggle('active', b.dataset.tab === id));
+    document.querySelectorAll('.tab-panel').forEach(p => p.classList.toggle('active', p.id === `panel-${id}`));
+    document.getElementById('page-title').textContent = PAGE_TITLES[id] || id;
+    currentTab = id;
+    if (id === 'database') renderDbExplorer();
+}
+
+// ── Utilities ─────────────────────────────────
+const delay = ms => new Promise(r => setTimeout(r, ms));
+
+// ── Init ──────────────────────────────────────
+document.addEventListener('DOMContentLoaded', () => {
+
+    // Capability checks
+    const secEl = document.getElementById('cap-secure');
+    const waEl  = document.getElementById('cap-webauthn');
+
+    if (window.isSecureContext) { secEl.textContent = 'Active'; secEl.className = 'cap-badge active'; }
+    else { secEl.textContent = 'Inactive'; secEl.className = 'cap-badge'; }
+
+    if (window.PublicKeyCredential) { waEl.textContent = 'Supported'; waEl.className = 'cap-badge active'; }
+    else { waEl.textContent = 'Unavailable'; waEl.className = 'cap-badge'; }
+
+    // Sidebar mobile toggle
+    const menuBtn = document.getElementById('menu-toggle');
+    const sidebar = document.getElementById('sidebar');
+    if (menuBtn) menuBtn.addEventListener('click', () => sidebar.classList.toggle('open'));
+
+    // Navigation
+    document.querySelectorAll('.nav-btn').forEach(btn => btn.addEventListener('click', () => {
+        switchTab(btn.dataset.tab);
+        if (window.innerWidth < 900) sidebar.classList.remove('open');
+    }));
+
+    document.querySelectorAll('.tab-link').forEach(btn => btn.addEventListener('click', () => switchTab(btn.dataset.target)));
+
+    // Firebase modal
+    const modal = document.getElementById('modal-firebase');
+    const openModal = () => modal.classList.add('open');
+    const closeModal = () => modal.classList.remove('open');
+
+    document.getElementById('btn-open-firebase').addEventListener('click', openModal);
+    document.getElementById('db-pill').addEventListener('click', openModal);
+    document.getElementById('btn-close-modal').addEventListener('click', closeModal);
+    modal.addEventListener('click', e => { if (e.target === modal) closeModal(); });
+
+    document.getElementById('btn-use-local').addEventListener('click', () => { setLocalMode(); closeModal(); });
+
+    document.getElementById('btn-connect-firebase').addEventListener('click', () => {
+        const raw = document.getElementById('firebase-json').value.trim();
+        if (!raw) { alert('Paste your Firebase config JSON.'); return; }
+        try {
+            const cfg = JSON.parse(raw);
+            if (!cfg.apiKey || !cfg.projectId) throw new Error('Missing apiKey or projectId');
+            connectFirebase(cfg);
+            closeModal();
+        } catch(e) { alert('Invalid JSON: ' + e.message); }
     });
-    const hash = await sha256(concatString);
-    return bufferToHex(hash);
-}
 
-// Seals secret data to selected PCR registers
-async function handleSealSecret() {
-    const payload = document.getElementById("seal-secret").value.trim();
-    if (!payload) {
-        alert("Please enter a secret to seal.");
-        return;
-    }
+    // WebAuthn
+    document.getElementById('btn-register').addEventListener('click', doRegister);
+    document.getElementById('btn-login').addEventListener('click', doLogin);
+    document.getElementById('btn-clear-console').addEventListener('click', () => {
+        document.getElementById('crypto-console').innerHTML = '<div class="console-line info">[SYS] Console cleared.</div>';
+    });
 
-    // Build array of checked PCR registers
-    const selection = [];
-    if (document.getElementById("seal-pcr0").checked) selection.push(0);
-    if (document.getElementById("seal-pcr4").checked) selection.push(4);
-    if (document.getElementById("seal-pcr8").checked) selection.push(8);
-    if (document.getElementById("seal-pcr9").checked) selection.push(9);
+    // Boot
+    document.getElementById('btn-boot').addEventListener('click', runMeasuredBoot);
+    document.getElementById('btn-attest').addEventListener('click', runAttestation);
+    document.getElementById('btn-save-baseline').addEventListener('click', saveGoldenBaseline);
+    document.getElementById('btn-reset-boot').addEventListener('click', resetBootChain);
 
-    if (selection.length === 0) {
-        alert("You must select at least one PCR register to bind this key policy to.");
-        return;
-    }
+    // Sealed Storage
+    document.getElementById('btn-seal').addEventListener('click', sealKey);
+    document.getElementById('btn-unseal').addEventListener('click', unsealKey);
 
-    // Compute composite hash of current states of target PCRs
-    const policyHash = await getSelectedPcrPolicyHash(selection);
-    
-    // Store in our database
-    sealedDataStore = {
-        secret: payload,
-        pcrSelection: selection,
-        targetPolicyHash: policyHash
-    };
+    // Database
+    document.getElementById('btn-refresh-db').addEventListener('click', renderDbExplorer);
+    document.getElementById('btn-clear-db').addEventListener('click', async () => {
+        if (confirm('Clear all database tables?')) { await DB.clearAll(); renderDbExplorer(); }
+    });
 
-    // Save configuration state in localStorage
-    localStorage.setItem("tpm_sealed_store", JSON.stringify(sealedDataStore));
+    // Initial renders
+    tryLoadSavedFirebase();
+    renderBootChain();
+    renderPCRTable();
 
-    // Update UI Safe state
-    const safe = document.getElementById("tpm-safe-element");
-    safe.className = "tpm-safe locked";
-    
-    document.getElementById("safe-status-title").innerText = "TPM KEY SEALED";
-    document.getElementById("safe-status-title").className = "safe-status-text locked";
-    document.getElementById("safe-status-desc").innerText = `Cryptographically sealed to PCRs: [${selection.join(", ")}]. TPM will deny decryption if these registers change.`;
-    document.getElementById("unsealed-payload-card").style.display = "none";
-    
-    alert("Key sealed in TPM storage. Try changing boot components and unsealing to test protection!");
-}
-
-// Unseals/Decrypts sealed key from TPM
-async function handleUnsealSecret() {
-    if (!sealedDataStore.secret) {
-        alert("No key is currently sealed. Seal a secret key first.");
-        return;
-    }
-
-    const payloadCard = document.getElementById("unsealed-payload-card");
-    const payloadVal = document.getElementById("unsealed-payload");
-    const safe = document.getElementById("tpm-safe-element");
-    const statusTitle = document.getElementById("safe-status-title");
-    const statusDesc = document.getElementById("safe-status-desc");
-
-    // Retrieve current values of selected PCRs and calculate current policy hash
-    const currentPolicyHash = await getSelectedPcrPolicyHash(sealedDataStore.pcrSelection);
-
-    if (currentPolicyHash === sealedDataStore.targetPolicyHash) {
-        // PCR state matches! Release secret.
-        safe.className = "tpm-safe unlocked";
-        statusTitle.innerText = "UNSEAL SUCCESSFUL";
-        statusTitle.className = "safe-status-text unlocked";
-        statusDesc.innerText = "PCR states verified. TPM has released the cryptographic decryption key.";
-        
-        payloadVal.innerText = sealedDataStore.secret;
-        payloadCard.style.display = "block";
-    } else {
-        // PCR states DO NOT MATCH! Refuse to release secret.
-        safe.className = "tpm-safe compromised";
-        statusTitle.innerText = "ACCESS DENIED: PCR MISMATCH";
-        statusTitle.className = "safe-status-text compromised";
-        statusDesc.innerText = "TPM Hardware Error: Platform configuration registers do not match policy requirements! Data locked.";
-        
-        payloadCard.style.display = "none";
-    }
-}
-
-// Real-time evaluation of sealed safe UI status during boot transitions
-async function evaluateSealedStorageState() {
-    if (!sealedDataStore.secret) return;
-
-    const safe = document.getElementById("tpm-safe-element");
-    const statusTitle = document.getElementById("safe-status-title");
-    const statusDesc = document.getElementById("safe-status-desc");
-    const payloadCard = document.getElementById("unsealed-payload-card");
-
-    const currentPolicyHash = await getSelectedPcrPolicyHash(sealedDataStore.pcrSelection);
-
-    if (currentPolicyHash === sealedDataStore.targetPolicyHash) {
-        safe.className = "tpm-safe locked"; // Ready to unlock
-        statusTitle.innerText = "TPM KEY SEALED";
-        statusTitle.className = "safe-status-text locked";
-        statusDesc.innerText = `Prerequisite PCR states match. Ready to decrypt.`;
-    } else {
-        safe.className = "tpm-safe compromised";
-        statusTitle.innerText = "INTEGRITY FAULT DETECTED";
-        statusTitle.className = "safe-status-text compromised";
-        statusDesc.innerText = "Active boot registers differ from sealed signature constraints. Decryption blocked.";
-        payloadCard.style.display = "none";
-    }
-}
-
-// Load previously sealed key from localStorage
-function loadSavedSealedData() {
-    const saved = localStorage.getItem("tpm_sealed_store");
+    // Load sealed store if any
+    const saved = localStorage.getItem('sealed_store');
     if (saved) {
         try {
-            sealedDataStore = JSON.parse(saved);
-            const selection = sealedDataStore.pcrSelection;
-            const safe = document.getElementById("tpm-safe-element");
-            
-            safe.className = "tpm-safe locked";
-            document.getElementById("safe-status-title").innerText = "TPM KEY SEALED";
-            document.getElementById("safe-status-title").className = "safe-status-text locked";
-            document.getElementById("safe-status-desc").innerText = `Cryptographically sealed to PCRs: [${selection.join(", ")}]. TPM will deny decryption if these registers change.`;
-        } catch (e) {
-            sealedDataStore = {};
-        }
-    }
-}
-
-// ==================== DATABASE EXPLORER RENDERER ====================
-async function renderDbExplorer() {
-    const credsBody = document.getElementById("db-credentials-body");
-    const baselineBody = document.getElementById("db-baselines-body");
-    const logsBody = document.getElementById("db-logs-body");
-
-    // 1. Credentials
-    const credsList = await DbService.getAllCredentials();
-    if (credsList.length === 0) {
-        credsBody.innerHTML = `<tr><td colspan="4" style="text-align:center; color:#64748b;">No credentials registered.</td></tr>`;
-    } else {
-        credsBody.innerHTML = credsList.map(c => `
-            <tr>
-                <td><strong>${escapeHtml(c.username)}</strong></td>
-                <td><code>${escapeHtml(c.credentialId.substring(0, 16))}...</code></td>
-                <td><code>x: ${escapeHtml(c.publicKeyJwk.x.substring(0, 8))}... | y: ${escapeHtml(c.publicKeyJwk.y.substring(0, 8))}...</code></td>
-                <td><span style="font-size:0.75rem;">${new Date(c.registeredAt).toLocaleString()}</span></td>
-            </tr>
-        `).join("");
+            sealedStore = JSON.parse(saved);
+            setSafeUI('', 'TPM KEY SEALED', `Bound to PCRs [${sealedStore.pcrSelection.join(', ')}]`);
+        } catch(e) { sealedStore = {}; }
     }
 
-    // 2. Baselines
-    const baselineList = await DbService.getBaselines();
-    if (baselineList.length === 0) {
-        baselineBody.innerHTML = `<tr><td colspan="2" style="text-align:center; color:#64748b;">No baselines set. Run Attestation first.</td></tr>`;
-    } else {
-        baselineBody.innerHTML = baselineList.map(b => `
-            <tr>
-                <td><strong>${escapeHtml(b.name)}</strong></td>
-                <td><code>${escapeHtml(b.hash)}</code></td>
-            </tr>
-        `).join("");
-    }
-
-    // 3. Audit Logs
-    const logList = await DbService.getAttestationLogs();
-    if (logList.length === 0) {
-        logsBody.innerHTML = `<tr><td colspan="3" style="text-align:center; color:#64748b;">No attestation records found.</td></tr>`;
-    } else {
-        logsBody.innerHTML = logList.map(l => `
-            <tr>
-                <td><span style="font-size:0.75rem;">${new Date(l.timestamp).toLocaleTimeString()}</span></td>
-                <td>
-                    <span class="badge ${l.status === 'Secure' ? 'badge-secure' : 'badge-tampered'}">
-                        ${l.status}
-                    </span>
-                </td>
-                <td style="font-size:0.75rem;">${escapeHtml(l.details)}</td>
-            </tr>
-        `).join("");
-    }
-}
-
-function escapeHtml(unsafe) {
-    if (!unsafe) return "";
-    return unsafe
-         .replace(/&/g, "&amp;")
-         .replace(/</g, "&lt;")
-         .replace(/>/g, "&gt;")
-         .replace(/"/g, "&quot;")
-         .replace(/'/g, "&#039;");
-}
-
-async function handleClearDatabase() {
-    if (confirm("Are you sure you want to clear all tables in the active database (credentials, baselines, and logs)?")) {
-        await DbService.clearAllData();
-        alert("Database cleared successfully!");
-        if (currentTab === "database") renderDbExplorer();
-        resetBootChain();
-    }
-}
-
-// ==================== NAVIGATION & TAB HANDLING ====================
-function switchTab(tabId) {
-    // Update active nav-link UI
-    document.querySelectorAll(".nav-item").forEach(item => {
-        if (item.getAttribute("data-tab") === tabId) {
-            item.classList.add("active");
-        } else {
-            item.classList.remove("active");
-        }
-    });
-
-    // Update visible panel
-    document.querySelectorAll(".tab-panel").forEach(panel => {
-        if (panel.id === `panel-${tabId}`) {
-            panel.classList.add("active");
-        } else {
-            panel.classList.remove("active");
-        }
-    });
-
-    currentTab = tabId;
-
-    // Load data specific to tabs
-    if (tabId === "database") {
-        renderDbExplorer();
-    }
-}
-
-// ==================== APP INITIALIZATION & EVENT LISTENERS ====================
-document.addEventListener("DOMContentLoaded", () => {
-    // Detect Secure Context & WebAuthn Capabilities
-    const capSecure = document.getElementById("cap-secure");
-    const capWebauthn = document.getElementById("cap-webauthn");
-
-    if (window.isSecureContext) {
-        capSecure.innerText = "ACTIVE";
-        capSecure.className = "cap-value active";
-    } else {
-        capSecure.innerText = "INACTIVE";
-        capSecure.className = "cap-value inactive";
-        logCrypto("WARNING: Secure Context is inactive. WebAuthn operations will fail.", "warning");
-    }
-
-    if (window.navigator.credentials && window.navigator.credentials.create) {
-        capWebauthn.innerText = "SUPPORTED";
-        capWebauthn.className = "cap-value active";
-    } else {
-        capWebauthn.innerText = "UNSUPPORTED";
-        capWebauthn.className = "cap-value inactive";
-        logCrypto("WARNING: WebAuthn browser support is missing.", "warning");
-    }
-
-    // Set up Event Listeners for Tab Navigation
-    document.querySelectorAll(".nav-item").forEach(item => {
-        item.addEventListener("click", () => {
-            const target = item.getAttribute("data-tab");
-            switchTab(target);
-        });
-    });
-
-    // Dashboard navigation links
-    document.querySelectorAll(".tab-link").forEach(link => {
-        link.addEventListener("click", () => {
-            const target = link.getAttribute("data-target");
-            switchTab(target);
-        });
-    });
-
-    // Settings Modal controls
-    const modal = document.getElementById("settings-modal");
-    document.getElementById("btn-open-settings").addEventListener("click", () => {
-        modal.classList.add("active");
-    });
-
-    document.getElementById("btn-close-settings").addEventListener("click", () => {
-        modal.classList.remove("active");
-    });
-
-    document.getElementById("firebase-status-pill").addEventListener("click", () => {
-        modal.classList.add("active");
-    });
-
-    document.getElementById("btn-use-mock-db").addEventListener("click", () => {
-        useLocalMockDb();
-        modal.classList.remove("active");
-    });
-
-    document.getElementById("btn-save-firebase-config").addEventListener("click", () => {
-        const configText = document.getElementById("firebase-config-json").value.trim();
-        if (!configText) {
-            alert("Please paste your Firebase configuration JSON.");
-            return;
-        }
-
-        try {
-            const config = JSON.parse(configText);
-            if (!config.apiKey || !config.projectId) {
-                throw new Error("Missing critical keys (apiKey or projectId)");
-            }
-            initFirebase(config);
-            modal.classList.remove("active");
-        } catch (e) {
-            alert(`Malformed JSON config object: ${e.message}`);
-        }
-    });
-
-    // WebAuthn Event Listeners
-    document.getElementById("btn-webauthn-register").addEventListener("click", handleWebAuthnRegister);
-    document.getElementById("btn-webauthn-login").addEventListener("click", handleWebAuthnLogin);
-    document.getElementById("btn-console-clear").addEventListener("click", () => {
-        document.getElementById("webauthn-console").innerHTML = `<div class="console-line info">[System] Security console logs cleared.</div>`;
-    });
-
-    // Measured Boot Event Listeners
-    document.getElementById("btn-simulate-boot").addEventListener("click", runMeasuredBoot);
-    document.getElementById("btn-remote-attestation").addEventListener("click", handleRemoteAttestation);
-    document.getElementById("btn-save-as-baseline").addEventListener("click", saveCurrentAsGoldenBaseline);
-    document.getElementById("btn-reset-boot").addEventListener("click", resetBootChain);
-
-    // Sealed Storage Event Listeners
-    document.getElementById("btn-seal-data").addEventListener("click", handleSealSecret);
-    document.getElementById("btn-unseal-data").addEventListener("click", handleUnsealSecret);
-
-    // Database Explorer Event Listeners
-    document.getElementById("btn-refresh-db").addEventListener("click", renderDbExplorer);
-    document.getElementById("btn-clear-db").addEventListener("click", handleClearDatabase);
-
-    // Initial renders & configuration load
-    loadSavedFirebaseConfig();
-    loadSavedSealedData();
-    renderBootLoaderChain();
-    renderPcrRegisters();
+    // Pre-load Firebase JSON if saved
+    const fbCfg = localStorage.getItem('fb_config');
+    if (fbCfg) document.getElementById('firebase-json').value = fbCfg;
 });
