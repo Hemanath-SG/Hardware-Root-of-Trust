@@ -1,0 +1,454 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Hardware Root of Trust (RoT) Visual Console</title>
+    <!-- Fonts -->
+    <link rel="stylesheet" href="styles.css">
+    <!-- Lucide Icons -->
+    <script src="https://unpkg.com/lucide@latest"></script>
+    <!-- Firebase SDK (Compat Version for ease of direct static scripting) -->
+    <script src="https://www.gstatic.com/firebasejs/10.8.0/firebase-app-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/10.8.0/firebase-firestore-compat.js"></script>
+</head>
+<body>
+
+    <div class="app-container">
+        
+        <!-- Sidebar Navigation -->
+        <aside class="sidebar">
+            <div>
+                <div class="logo-container">
+                    <i data-lucide="shield-check" class="logo-icon"></i>
+                    <span class="logo-text">HARDWARE RoT</span>
+                </div>
+                
+                <ul class="nav-links">
+                    <li class="nav-item active" data-tab="dashboard">
+                        <button><i data-lucide="layout-dashboard"></i>Dashboard</button>
+                    </li>
+                    <li class="nav-item" data-tab="webauthn">
+                        <button><i data-lucide="fingerprint"></i>WebAuthn Auth</button>
+                    </li>
+                    <li class="nav-item" data-tab="boot">
+                        <button><i data-lucide="cpu"></i>Measured Boot</button>
+                    </li>
+                    <li class="nav-item" data-tab="sealed">
+                        <button><i data-lucide="safe"></i>Sealed Storage</button>
+                    </li>
+                    <li class="nav-item" data-tab="database">
+                        <button><i data-lucide="database"></i>Database Explorer</button>
+                    </li>
+                </ul>
+            </div>
+            
+            <div class="sidebar-footer">
+                <!-- System Capability Indicators -->
+                <div class="cap-badge">
+                    <div class="cap-title">Local System Capabilities</div>
+                    <div class="cap-item">
+                        <span class="cap-label">Secure Context</span>
+                        <span id="cap-secure" class="cap-value inactive">Detecting...</span>
+                    </div>
+                    <div class="cap-item">
+                        <span class="cap-label">WebAuthn API</span>
+                        <span id="cap-webauthn" class="cap-value inactive">Detecting...</span>
+                    </div>
+                    <div class="cap-item">
+                        <span class="cap-label">TPM Emulator</span>
+                        <span class="cap-value active">Ready</span>
+                    </div>
+                </div>
+                
+                <button class="btn btn-secondary btn-sm" id="btn-open-settings">
+                    <i data-lucide="settings"></i>Firebase Config
+                </button>
+            </div>
+        </aside>
+
+        <!-- Main Display Frame -->
+        <main class="main-content">
+            
+            <!-- Top Status Bar -->
+            <header class="top-bar">
+                <h2 class="page-title" id="page-title">Root of Trust Control Center</h2>
+                
+                <!-- Firebase database connection state indicator -->
+                <div class="firebase-status-pill" id="firebase-status-pill" title="Click to configure Firebase">
+                    <span class="status-dot local" id="firebase-status-dot"></span>
+                    <span id="firebase-status-text">Local Mock Mode</span>
+                </div>
+            </header>
+
+            <!-- ==================== DASHBOARD PANEL ==================== -->
+            <div class="tab-panel active" id="panel-dashboard">
+                <div class="glass-panel" style="margin-bottom: 1.5rem;">
+                    <h2>Hardware-Enabled Root of Trust</h2>
+                    <p style="margin-top: 0.5rem;">
+                        A <strong>Root of Trust (RoT)</strong> is a source that is trusted by default within a cryptographic system. 
+                        Traditionally, software roots of trust are vulnerable because if a hacker obtains kernel/root access, they can alter the trust verification code. 
+                        <strong>Hardware-Enabled Root of Trust</strong> anchors security in immutable hardware modules (like the Trusted Platform Module / TPM or Secure Enclave). 
+                        It is physically isolated from the CPU, containing its own cryptographic engines, non-volatile memory, and unique factory-burned endorsement keys.
+                    </p>
+                    
+                    <div class="rot-architecture-diagram">
+                        <div class="rot-node rot-anchor">
+                            <i data-lucide="cpu"></i>
+                            <div class="rot-node-title">Hardware RoT</div>
+                            <div class="rot-node-desc">TPM / Secure Enclave (Root Keys)</div>
+                        </div>
+                        <div class="rot-flow-arrow"></div>
+                        <div class="rot-node">
+                            <i data-lucide="key-round"></i>
+                            <div class="rot-node-title">Measured Boot</div>
+                            <div class="rot-node-desc">Verifies Loader, Kernel, & Drivers</div>
+                        </div>
+                        <div class="rot-flow-arrow"></div>
+                        <div class="rot-node">
+                            <i data-lucide="shield-check"></i>
+                            <div class="rot-node-title">Remote Attestation</div>
+                            <div class="rot-node-desc">Proves boot state to remote server</div>
+                        </div>
+                        <div class="rot-flow-arrow"></div>
+                        <div class="rot-node">
+                            <i data-lucide="fingerprint"></i>
+                            <div class="rot-node-title">WebAuthn Auth</div>
+                            <div class="rot-node-desc">Hardware-backed User Sign-in</div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="grid-2col">
+                    <div class="glass-panel">
+                        <h3><i data-lucide="fingerprint" class="logo-icon" style="vertical-align:middle; margin-right:5px;"></i>Hardware-Backed Identity</h3>
+                        <p style="margin-top: 0.5rem; font-size: 0.9rem;">
+                            <strong>WebAuthn</strong> allows websites to leverage local hardware authenticators (TPMs, Windows Hello, YubiKeys) for secure, passwordless authentication. 
+                            The private keys never leave the hardware boundary. During register/login, the hardware generates a signature using these keys. 
+                            Our demo shows the actual cryptographic assertions and verifies them in real time.
+                        </p>
+                        <button class="btn btn-cyan btn-sm tab-link" data-target="webauthn">Open WebAuthn Demo</button>
+                    </div>
+
+                    <div class="glass-panel">
+                        <h3><i data-lucide="activity" class="logo-icon" style="vertical-align:middle; margin-right:5px;"></i>Boot Integrity & Storage</h3>
+                        <p style="margin-top: 0.5rem; font-size: 0.9rem;">
+                            <strong>Measured Boot</strong> computes cryptographic hashes of every step of the boot loader chain, compounding them into the hardware TPM's Platform Configuration Registers (PCRs).
+                            <strong>Remote Attestation</strong> sends signed PCR reports to a verifier (Firebase) to check for malware tampering.
+                            <strong>Sealed Storage</strong> encrypts data such that it only decrypts if the boot state matches reference values.
+                        </p>
+                        <button class="btn btn-cyan btn-sm tab-link" data-target="boot">Open Integrity Demo</button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- ==================== WEBAUTHN PANEL ==================== -->
+            <div class="tab-panel" id="panel-webauthn">
+                <div class="grid-1-2">
+                    
+                    <!-- Control Form -->
+                    <div class="glass-panel">
+                        <div class="panel-header">
+                            <div class="panel-title"><i data-lucide="fingerprint"></i>Registration & Login</div>
+                        </div>
+                        
+                        <p style="font-size:0.85rem; margin-bottom:1.5rem;">
+                            Register an account using your hardware security key or platform biometric authenticator (Windows Hello, FaceID). 
+                            The private credential will be generated inside the hardware, while the public key is saved in Firestore.
+                        </p>
+
+                        <div class="form-group">
+                            <label for="auth-username">Username / Identifier</label>
+                            <input type="text" id="auth-username" class="form-control" placeholder="e.g. administrator" value="admin-rot">
+                        </div>
+
+                        <div style="display:flex; flex-direction:column; gap:0.75rem; margin-top:1.5rem;">
+                            <button class="btn" id="btn-webauthn-register">
+                                <i data-lucide="user-plus"></i>Register Hardware Credential
+                            </button>
+                            <button class="btn btn-secondary" id="btn-webauthn-login">
+                                <i data-lucide="log-in"></i>Authenticate via Hardware
+                            </button>
+                        </div>
+
+                        <div id="auth-status-card" class="glass-panel" style="margin-top:1.5rem; background:rgba(0,0,0,0.15); display:none;">
+                            <h4 id="auth-status-title" style="color:var(--clr-cyan); font-size:0.9rem; margin-bottom:0.25rem;">
+                                Authentication Successful
+                            </h4>
+                            <p id="auth-status-body" style="font-size:0.8rem; margin-bottom:0;"></p>
+                        </div>
+                    </div>
+
+                    <!-- Cryptographic Hex/Console Visualizer -->
+                    <div class="glass-panel">
+                        <div class="console-header">
+                            <div><i data-lucide="terminal" style="vertical-align:middle; margin-right:4px;"></i>Cryptographic Security Console</div>
+                            <button class="btn-console-clear" id="btn-console-clear">Clear Logs</button>
+                        </div>
+                        <div class="crypto-console" id="webauthn-console">
+                            <div class="console-line info">[System] Security console initialized. Ready for challenge transactions...</div>
+                        </div>
+                    </div>
+
+                </div>
+            </div>
+
+            <!-- ==================== MEASURED BOOT & ATTESTATION PANEL ==================== -->
+            <div class="tab-panel" id="panel-boot">
+                <div class="grid-2col">
+                    
+                    <!-- Boot Chain Control -->
+                    <div class="glass-panel">
+                        <div class="panel-header">
+                            <div class="panel-title"><i data-lucide="cpu"></i>Boot Chain Integrator</div>
+                            <button class="btn btn-secondary btn-sm" id="btn-reset-boot">Reset Chain</button>
+                        </div>
+                        <p style="font-size:0.85rem; margin-bottom:1.5rem;">
+                            Simulate the bootloader execution. You can deliberately **Tamper** with components (firmware, grub loader, kernel, system config) to simulate malware infecting the boot pipeline.
+                        </p>
+
+                        <div class="boot-chain-visualizer" id="boot-chain-container">
+                            <!-- Boot Loader components will be rendered here dynamically -->
+                        </div>
+
+                        <div style="display:flex; gap:0.75rem;">
+                            <button class="btn btn-cyan" id="btn-simulate-boot">
+                                <i data-lucide="play"></i>Execute Boot Sequence
+                            </button>
+                            <button class="btn" id="btn-remote-attestation">
+                                <i data-lucide="network"></i>Run Remote Attestation
+                            </button>
+                        </div>
+                    </div>
+
+                    <!-- TPM State / PCR Registers & Attestation Verification Results -->
+                    <div class="glass-panel" style="display:flex; flex-direction:column; justify-content:space-between; gap:1.5rem;">
+                        <div>
+                            <div class="panel-header">
+                                <div class="panel-title"><i data-lucide="database"></i>TPM Platform Configuration Registers (PCRs)</div>
+                            </div>
+                            <p style="font-size:0.85rem; margin-bottom:1rem;">
+                                Platform Configuration Registers (PCRs) are cryptographic registers inside the hardware TPM. 
+                                They cannot be written directly; they can only be <strong>extended</strong>: 
+                                <code style="font-size:0.75rem;">PCR_val = SHA256(PCR_val + Measurement)</code>. 
+                                This creates a cryptographically un-forgeable audit trail of the boot sequence.
+                            </p>
+                            
+                            <div class="pcr-console">
+                                <div class="pcr-grid" id="pcr-grid-container">
+                                    <!-- PCR Rows will be loaded here dynamically -->
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="glass-panel" style="background:rgba(0,0,0,0.15);" id="attestation-result-card">
+                            <div class="panel-title" id="attest-status-header" style="color:var(--clr-cyan); font-size:1rem; margin-bottom:0.5rem;">
+                                <i data-lucide="help-circle" style="vertical-align:middle;"></i> Attestation Status: Waiting for Boot
+                            </div>
+                            <p id="attest-status-desc" style="font-size:0.85rem; margin-bottom:0.75rem;">
+                                Execute Measured Boot and run Remote Attestation to query server integrity validation.
+                            </p>
+                            <div id="attest-baseline-actions" style="display:none;">
+                                <button class="btn btn-secondary btn-sm" id="btn-save-as-baseline">
+                                    <i data-lucide="save"></i>Save Current Boot as Golden Baseline
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+
+                </div>
+            </div>
+
+            <!-- ==================== SEALED STORAGE PANEL ==================== -->
+            <div class="tab-panel" id="panel-sealed">
+                <div class="grid-2col">
+                    
+                    <!-- Seal Secrets form -->
+                    <div class="glass-panel">
+                        <div class="panel-header">
+                            <div class="panel-title"><i data-lucide="lock"></i>Seal Data to Platform Config</div>
+                        </div>
+                        <p style="font-size:0.85rem;">
+                            Sealing binds secret data (like disk encryption keys or API tokens) to specific TPM PCR values. 
+                            The hardware TPM will only release (unseal) this data if the system's current PCR hashes exactly match the configuration selected at sealing time.
+                        </p>
+
+                        <div class="form-group" style="margin-top:1.5rem;">
+                            <label for="seal-secret">Secret Data to Encrypt / Seal</label>
+                            <input type="text" id="seal-secret" class="form-control" placeholder="e.g. CRYPT_DISK_DECRYPT_KEY_9812A">
+                        </div>
+
+                        <div class="form-group">
+                            <label>Bind to PCR Components (Select to seal)</label>
+                            <div style="display:flex; flex-direction:column; gap:0.5rem; background:rgba(0,0,0,0.15); padding:0.75rem; border-radius:8px; border:1px solid var(--border-color);">
+                                <label style="display:flex; align-items:center; gap:0.5rem; cursor:pointer; color:#e2e8f0; font-weight:normal; margin-bottom:0;">
+                                    <input type="checkbox" id="seal-pcr0" checked> PCR 0: Firmware (UEFI / ROM)
+                                </label>
+                                <label style="display:flex; align-items:center; gap:0.5rem; cursor:pointer; color:#e2e8f0; font-weight:normal; margin-bottom:0;">
+                                    <input type="checkbox" id="seal-pcr4" checked> PCR 4: Bootloader (GRUB)
+                                </label>
+                                <label style="display:flex; align-items:center; gap:0.5rem; cursor:pointer; color:#e2e8f0; font-weight:normal; margin-bottom:0;">
+                                    <input type="checkbox" id="seal-pcr8" checked> PCR 8: OS Kernel
+                                </label>
+                                <label style="display:flex; align-items:center; gap:0.5rem; cursor:pointer; color:#e2e8f0; font-weight:normal; margin-bottom:0;">
+                                    <input type="checkbox" id="seal-pcr9"> PCR 9: System Drivers
+                                </label>
+                            </div>
+                        </div>
+
+                        <button class="btn" id="btn-seal-data" style="width:100%;">
+                            <i data-lucide="key-round"></i>Seal Key in TPM
+                        </button>
+                    </div>
+
+                    <!-- Seal visual safe -->
+                    <div class="glass-panel" style="display:flex; flex-direction:column; align-items:center; justify-content:center;">
+                        <div class="sealed-storage-container">
+                            <div class="tpm-safe locked" id="tpm-safe-element">
+                                <i data-lucide="lock"></i>
+                            </div>
+                            <div class="safe-status-text locked" id="safe-status-title">TPM KEY SEALED</div>
+                            <p style="text-align:center; font-size:0.85rem; max-width:80%;" id="safe-status-desc">
+                                Encryption key is cryptographically sealed under current configuration baselines.
+                            </p>
+                            
+                            <div style="display:flex; gap:0.75rem; width:80%; margin-top:1rem;">
+                                <button class="btn btn-cyan btn-sm" id="btn-unseal-data" style="flex-grow:1;">
+                                    <i data-lucide="unlock"></i>Unseal / Decrypt Key
+                                </button>
+                            </div>
+
+                            <div class="glass-panel" id="unsealed-payload-card" style="margin-top:1.5rem; width:90%; display:none; background:rgba(16,185,129,0.05); border-color:var(--clr-emerald);">
+                                <div style="font-size:0.7rem; text-transform:uppercase; color:var(--clr-emerald); font-weight:800; letter-spacing:1px; margin-bottom:0.25rem;">
+                                    Decrypted Secret Payload:
+                                </div>
+                                <div style="font-family:var(--font-mono); font-size:0.95rem; color:#ffffff;" id="unsealed-payload">
+                                    --
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                </div>
+            </div>
+
+            <!-- ==================== DATABASE EXPLORER PANEL ==================== -->
+            <div class="tab-panel" id="panel-database">
+                <div class="glass-panel" style="margin-bottom:1.5rem;">
+                    <div class="panel-header">
+                        <div class="panel-title"><i data-lucide="database"></i>Database Explorer & Logs</div>
+                        <div style="display:flex; gap:0.5rem;">
+                            <button class="btn btn-secondary btn-sm" id="btn-refresh-db">
+                                <i data-lucide="refresh-cw"></i>Refresh
+                            </button>
+                            <button class="btn btn-red btn-sm" id="btn-clear-db">
+                                <i data-lucide="trash-2"></i>Reset Database
+                            </button>
+                        </div>
+                    </div>
+                    <p style="font-size:0.85rem; margin-bottom:1rem;">
+                        This panel displays the raw stored configurations and data in the database (Firebase Firestore or Local Storage). 
+                        It contains registration credentials, golden baseline measurements for attestation, and attestation event logging.
+                    </p>
+                </div>
+
+                <div class="glass-panel" style="margin-bottom:1.5rem;">
+                    <div class="panel-title" style="margin-bottom:1rem;"><i data-lucide="users"></i>Registered WebAuthn Credentials (`webauthn_credentials`)</div>
+                    <div class="db-table-wrapper">
+                        <table class="db-table">
+                            <thead>
+                                <tr>
+                                    <th>Username</th>
+                                    <th>Credential ID (Truncated)</th>
+                                    <th>JWK Public Key (Truncated)</th>
+                                    <th>Registered Date</th>
+                                </tr>
+                            </thead>
+                            <tbody id="db-credentials-body">
+                                <tr><td colspan="4" style="text-align:center; color:#64748b;">No credentials registered.</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+
+                <div class="grid-2col">
+                    <div class="glass-panel">
+                        <div class="panel-title" style="margin-bottom:1rem;"><i data-lucide="shield"></i>Boot PCR Baselines (`boot_baselines`)</div>
+                        <div class="db-table-wrapper">
+                            <table class="db-table">
+                                <thead>
+                                    <tr>
+                                        <th>Component</th>
+                                        <th>Baseline Hash</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="db-baselines-body">
+                                    <tr><td colspan="2" style="text-align:center; color:#64748b;">No baselines set. Run Attestation first.</td></tr>
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+
+                    <div class="glass-panel">
+                        <div class="panel-title" style="margin-bottom:1rem;"><i data-lucide="history"></i>Attestation Audit Logs (`attestation_logs`)</div>
+                        <div class="db-table-wrapper">
+                            <table class="db-table">
+                                <thead>
+                                    <tr>
+                                        <th>Time</th>
+                                        <th>Status</th>
+                                        <th>Details</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="db-logs-body">
+                                    <tr><td colspan="3" style="text-align:center; color:#64748b;">No attestation records found.</td></tr>
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+        </main>
+    </div>
+
+    <!-- ==================== FIREBASE SETUP MODAL ==================== -->
+    <div class="modal-overlay" id="settings-modal">
+        <div class="glass-panel modal-card" style="background:var(--bg-panel-solid);">
+            <div class="panel-header">
+                <div class="panel-title"><i data-lucide="settings"></i>Firebase Firestore Setup</div>
+                <button class="btn-console-clear" id="btn-close-settings" style="font-size:1.25rem;">&times;</button>
+            </div>
+            
+            <p style="font-size:0.85rem; margin-bottom:1.25rem;">
+                By default, the app uses standard local storage database emulation. To plug in a real database, paste your **Firebase Web Project Web Configuration SDK snippet** (JSON block) below:
+            </p>
+
+            <div class="form-group">
+                <label for="firebase-config-json">Firebase Web Config Object (JSON)</label>
+                <textarea id="firebase-config-json" class="form-control" rows="8" placeholder='{
+  "apiKey": "AIzaSyA1...",
+  "authDomain": "my-project.firebaseapp.com",
+  "projectId": "my-project",
+  "storageBucket": "my-project.appspot.com",
+  "messagingSenderId": "12345678",
+  "appId": "1:1234:web:abcd"
+}' style="font-family:var(--font-mono); font-size:0.8rem; line-height:1.4;"></textarea>
+            </div>
+
+            <div style="display:flex; justify-content:flex-end; gap:0.75rem; margin-top:1.5rem;">
+                <button class="btn btn-secondary" id="btn-use-mock-db">Use Mock Local DB</button>
+                <button class="btn btn-cyan" id="btn-save-firebase-config">Connect to Firebase</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Application Script -->
+    <script src="app.js"></script>
+    <script>
+        // Init Lucide Icons
+        lucide.createIcons();
+    </script>
+</body>
+</html>
